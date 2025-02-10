@@ -11,9 +11,13 @@ WORLD_WIDTH = 4000
 WORLD_HEIGHT = 4000
 MIN_STAR_DISTANCE = 15
 STAR_RESOURCE_RANGE = (50, 200)  # Keep this, but it applies to each resource type
-PROBE_REPLICATION_COST = {"minerals": 70, "gases": 70, "energy":0}  # Cost in each resource
+PROBE_REPLICATION_COST = {"minerals": 70, "gases": 70, "energy": 0}  # Cost in each resource
 MAX_PROBES = 100
 COMMUNICATION_RADIUS = 200  # Introduce a communication radius
+REPLICATION_COOLDOWN_TIME = 100  # Cooldown in frames
+PROBE_CONSTRUCTION_THRESHOLD = 200  # Colony resource threshold to trigger probe construction
+PROBE_SPEED_UPGRADE_COST = {"minerals": 300, "gases": 300, "energy": 0}  # Cost for speed upgrade
+PROBE_SPEED_UPGRADE_AMOUNT = 1  # Amount to increase probe speed by
 
 
 # --------------------------
@@ -60,12 +64,15 @@ class Star:
 # Colony Class
 # --------------------------
 class Colony:
-    def __init__(self, x, y):
+    def __init__(self, x, y, stars):  # Added stars parameter
         self.x = x
         self.y = y
         self.minerals = 0
         self.gases = 0
         self.energy = 0
+        self.stars = stars  # Store stars for probe construction
+        self.probe_construction_timer = 0  # Timer to control probe construction frequency
+        self.probe_speed_researched = False  # Track if speed upgrade is researched
 
     def deposit(self, minerals, gases, energy):
         self.minerals += minerals
@@ -79,22 +86,67 @@ class Colony:
         if 0 - radius <= draw_x <= WIDTH + radius and 0 - radius <= draw_y <= HEIGHT + radius:
             pygame.draw.circle(screen, (0, 0, 255), (draw_x, draw_y), radius)
 
+    def construct_probe(self):
+        if (self.minerals >= PROBE_REPLICATION_COST["minerals"] and
+                self.gases >= PROBE_REPLICATION_COST["gases"]):  # Energy is free for probes
+
+            self.minerals -= PROBE_REPLICATION_COST["minerals"]
+            self.gases -= PROBE_REPLICATION_COST["gases"]
+
+            probe_speed = 2  # Base speed
+            if self.probe_speed_researched:  # Apply speed upgrade if researched
+                probe_speed += PROBE_SPEED_UPGRADE_AMOUNT
+
+            new_probe = Probe(self.x, self.y, self.stars, self, speed=probe_speed)  # Colony is now self, pass speed
+            new_probe.set_target(new_probe.find_nearest_star(), "traveling_to_star")
+            return new_probe
+        return None
+
+    def research_probe_speed_upgrade(self):
+        if not self.probe_speed_researched:  # Only research if not already done
+            if (self.minerals >= PROBE_SPEED_UPGRADE_COST["minerals"] and
+                    self.gases >= PROBE_SPEED_UPGRADE_COST["gases"]):
+
+                self.minerals -= PROBE_SPEED_UPGRADE_COST["minerals"]
+                self.gases -= PROBE_SPEED_UPGRADE_COST["gases"]
+                self.probe_speed_researched = True  # Mark upgrade as researched
+                print("Probe Speed Upgrade Researched!")
+                return True  # Research successful
+        return False  # Research failed or already done
+
+    def update(self, probes):  # Pass probes list to colony update
+        if not self.probe_speed_researched:  # Try to research speed upgrade first if not done
+            self.research_probe_speed_upgrade()  # Colony attempts to research every frame it has resources
+
+        if len(probes) < MAX_PROBES:  # Check probe limit
+            if (self.minerals > PROBE_CONSTRUCTION_THRESHOLD and
+                    self.gases > PROBE_CONSTRUCTION_THRESHOLD and
+                    self.probe_construction_timer <= 0):  # Check timer
+
+                new_probe = self.construct_probe()
+                if new_probe:
+                    probes.append(new_probe)  # Colony adds probe to the list
+                    self.probe_construction_timer = REPLICATION_COOLDOWN_TIME  # Reset timer
+        if self.probe_construction_timer > 0:
+            self.probe_construction_timer -= 1
+
 # --------------------------
 # Probe Class
 # --------------------------
 class Probe:
-    def __init__(self, x, y, stars, speed=2):
+    def __init__(self, x, y, stars, colony, speed=2):  # Add colony parameter and speed
         self.x = x
         self.y = y
-        self.speed = speed
+        self.speed = speed  # Now probe speed is set during construction
         self.cargo = {"minerals": 0, "gases": 0, "energy": 0}
         self.target = None
         self.state = "idle"
-        self.probes = []
-        self.stars = stars  # Store the stars in the probe instance
-        self.is_mining = False  # Flag to track if the probe is currently mining
-        self.max_cargo = {"minerals": 200, "gases": 200, "energy": 200}  # Set max capacity for each resource
-        self.visited_stars = set()  # Keep track of visited stars
+        self.stars = stars
+        self.colony = colony  # Store the colony reference
+        self.is_mining = False
+        self.max_cargo = {"minerals": 200, "gases": 200, "energy": 200}
+        self.visited_stars = set()
+        self.replication_cooldown = 0  # Initialize replication cooldown (still useful for other timed actions if needed later)
 
     def set_target(self, target, state):
         self.target = target
@@ -111,7 +163,7 @@ class Probe:
 
         if needed_resources:
             for star in self.stars:
-                if star in self.visited_stars:  # Skip visited stars
+                if star in self.visited_stars:
                     continue
                 for resource in needed_resources:
                     if getattr(star, resource) > 0:
@@ -119,13 +171,12 @@ class Probe:
                         if distance < nearest_distance:
                             nearest_distance = distance
                             nearest_star = star
-                        break  # Check next star
+                        break
             if nearest_star:
-                self.visited_stars.add(nearest_star)  # Mark as visited
+                self.visited_stars.add(nearest_star)
         return nearest_star
 
     def needs_resources(self):
-        # Determine which resources are needed
         needed = {}
         for resource, amount in self.cargo.items():
             if amount < self.max_cargo[resource]:
@@ -133,110 +184,96 @@ class Probe:
         return needed
 
     def find_star_with_resource(self, resource):
-        # Find a star that has the specified resource
         for star in self.stars:
-            if star in self.visited_stars:  # Skip stars that have been visited
+            if star in self.visited_stars:
                 continue
-            if getattr(star, resource) > 0:  # Check if the star has the resource
-                self.visited_stars.add(star)  # Once a star has been looked at mark it
+            if getattr(star, resource) > 0:
+                self.visited_stars.add(star)
                 return star
         return None
 
-    def update(self, other_probes):
-        self.communicate(other_probes)  # Pass the list of other probes
+    def update(self):
+        if self.replication_cooldown > 0:  # Decrement cooldown if active (can be used for other timed events later)
+            self.replication_cooldown -= 1
 
         if self.target:
             dx = self.target.x - self.x
             dy = self.target.y - self.y
             distance = math.hypot(dx, dy)
 
-            # *** MOVE THE PROBE FIRST ***
-            if distance > self.speed:  # Only move if not already at target
-                # Normalize the vector
+            if distance > self.speed:
                 dx, dy = dx / distance, dy / distance
                 self.x += dx * self.speed
                 self.y += dy * self.speed
-                # Recalculate distance after movement
                 distance = math.hypot(self.target.x - self.x, self.target.y - self.y)
 
-            # *** THEN CHECK FOR ARRIVAL ***
-            if distance <= self.speed:  # Arrived at target
+            if distance <= self.speed:
                 if isinstance(self.target, Star):
                     if self.target.total_resources() > 0:
                         needed_resources = self.needs_resources()
                         if needed_resources:
                             resource_to_mine = next(iter(needed_resources))
                             available_resources = getattr(self.target, resource_to_mine)
-
-                            # *** IMPROVED MINING AMOUNT CALCULATION ***
                             mining_amount = min(self.speed, self.max_cargo[resource_to_mine] - self.cargo[resource_to_mine], available_resources)
-                            if mining_amount > 0:  # only mine if we can mine something
+                            if mining_amount > 0:
                                 mined_amount = self.target.mine_resource(resource_to_mine, mining_amount)
                                 self.cargo[resource_to_mine] += mined_amount
-                                print(f"Probe mined {mined_amount} {resource_to_mine} from star. Cargo: {self.cargo}")  # Added Mined Amount
+                                print(f"Probe mined {mined_amount} {resource_to_mine} from star. Cargo: {self.cargo}")
 
                                 if self.target.total_resources() <= 0:
-                                    print(f"Star at ({self.target.x:.1f}, {self.target.y:.1f}) is depleted.")  # Added float formatting
+                                    print(f"Star at ({self.target.x:.1f}, {self.target.y:.1f}) is depleted.")
                                     self.target = None
-                                    self.state = "idle"  # Reset state *before* retargeting
+                                    self.state = "idle"
                                     self.set_target(self.find_nearest_star(), "traveling_to_star")
                                     return
-                            else:  # Added else statement for clarity
+                            else:
                                 star_coords_str = f"({self.target.x:.1f}, {self.target.y:.1f})"
                                 print(f"Star at {star_coords_str} does not have enough {resource_to_mine} or cargo full. Only {available_resources} available. Cargo: {self.cargo}")
                                 self.target = None
-                                self.state = "idle"  # Reset state *before* retargeting
+                                self.state = "idle"
                                 self.set_target(self.find_nearest_star(), "traveling_to_star")
                                 return
-
                         else:
-                            print(f"Probe has all resources. Finding a new target.")
-                            self.target = None
-                            self.state = "idle"  # Reset state *before* retargeting
-                            self.set_target(self.find_nearest_star(), "traveling_to_star")
+                            print(f"Probe has all resources. Returning to colony.")
+                            self.target = None  # Clear target first
+                            self.state = "idle"
+                            self.set_target(self.colony, "returning_to_colony")  # Target colony
                             return
 
                     else:
-                        print(f"Star at ({self.target.x:.1f}, {self.target.y:.1f}) is depleted.")  # Added float formatting
+                        print(f"Star at ({self.target.x:.1f}, {self.target.y:.1f}) is depleted.")
                         self.target = None
-                        self.state = "idle"  # Reset state *before* retargeting
+                        self.state = "idle"
                         self.set_target(self.find_nearest_star(), "traveling_to_star")
                         return
 
                 elif isinstance(self.target, Colony):
-                    # Deposit cargo into the colony.
-                    self.target.deposit(
-                        int(self.cargo["minerals"]),
-                        int(self.cargo["gases"]),
-                        int(self.cargo["energy"])
-                    )
-                    print(f"Probe delivered resources to colony: {self.cargo}")  # Keep this for important info
+                    self.target.deposit(int(self.cargo["minerals"]), int(self.cargo["gases"]), int(self.cargo["energy"]))
+                    print(f"Probe delivered resources to colony: {self.cargo}")
                     self.cargo = {"minerals": 0, "gases": 0, "energy": 0}
                     self.target = None
                     self.state = "idle"
-                    self.is_mining = False  # Reset mining flag
-                    self.visited_stars = set()  # Clear visited stars on returning to colony
+                    self.is_mining = False
+                    self.visited_stars = set()
 
                 elif isinstance(self.target, ExplorationTarget):
-                    # When a probe on an exploration mission arrives, it discovers an anomaly.
                     bonus = random.randint(20, 50)
-                    self.target.colony.deposit(bonus, bonus, bonus)
-                    print(f"Probe discovered an anomaly! Bonus resources: ")
+                    self.target.colony.deposit(bonus, bonus, bonus)  # Use target.colony
+                    print(f"Probe discovered an anomaly! Bonus resources: {bonus} of each type")
                     self.target = None
                     self.state = "idle"
-                    self.is_mining = False  # Reset mining flag
+                    self.is_mining = False
 
-        else:  # No Target. Find Target.
+        else:
             needed_resources = self.needs_resources()
             if needed_resources:
                 for resource in needed_resources:
                     star = self.find_star_with_resource(resource)
                     if star:
                         self.set_target(star, "traveling_to_star")
-                        return  # Prevent trying to find another target this cycle
-            # If we didn't find a specific resource, fall back to any nearest star. BUT still check visited.
+                        return
             self.set_target(self.find_nearest_star(), "traveling_to_star")
-            return  # Prevent trying to find another target this cycle
+            return
 
     def draw(self, screen, offset_x, offset_y, zoom_level):
         radius = 5 * zoom_level
@@ -259,28 +296,13 @@ class Probe:
         if isinstance(self.target, Colony):
             self.target.deposit(minerals, gases, energy)
 
-    def replicate(self):
-        if (len(self.probes) < MAX_PROBES and
-                self.cargo["minerals"] >= PROBE_REPLICATION_COST["minerals"] and
-                self.cargo["gases"] >= PROBE_REPLICATION_COST["gases"] and
-                self.cargo["energy"] >= PROBE_REPLICATION_COST["energy"]):
-
-            self.cargo["minerals"] -= PROBE_REPLICATION_COST["minerals"]
-            self.cargo["gases"] -= PROBE_REPLICATION_COST["gases"]
-            self.cargo["energy"] -= PROBE_REPLICATION_COST["energy"]
-            new_probe = Probe(self.x, self.y, self.stars)  # Spawn at current location
-            self.probes.append(new_probe)
-            print(f"New probe created! Total probes: {len(self.probes)}")
-            # Assign a target to the new probe
-            new_probe.set_target(new_probe.find_nearest_star(), "traveling_to_star")  # Give it a target
-
     def communicate(self, other_probes):
-        # Communicate Depleted Stars
         for other_probe in other_probes:
-            if other_probe != self:  # Don't communicate with itself
+            if other_probe != self:
                 distance = math.hypot(self.x - other_probe.x, self.y - other_probe.y)
                 if distance <= COMMUNICATION_RADIUS:
                     other_probe.visited_stars.update(self.visited_stars)
+        pass
 
     def is_hovered(self, mouse_x, mouse_y, zoom_level, offset_x, offset_y):
         radius = 5 * zoom_level
@@ -290,10 +312,10 @@ class Probe:
 
 
 class ExplorationTarget:
-    def __init__(self, x, y, colony):
+    def __init__(self, x, y, colony):  # Needs colony
         self.x = x
         self.y = y
-        self.colony = colony
+        self.colony = colony  # Store the colony
 
 # --------------------------
 # Galaxy Generation Function
@@ -337,13 +359,8 @@ def main():
     clock = pygame.time.Clock()
 
     stars = generate_galaxy(WORLD_WIDTH, WORLD_HEIGHT, 2000)
-    # Initialize probes *after* stars to pass star list.
-    probes = [Probe(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, stars)]
-    colony = Colony(WORLD_WIDTH // 2, WORLD_HEIGHT // 2)
-    # Make additional initial probes
-    probes[0].replicate()
-    probes[0].replicate()
-    probes[0].replicate()
+    colony = Colony(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, stars)  # Pass stars to colony
+    probes = [Probe(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, stars, colony)]  # Pass colony
 
     zoom_level = 1.0
     offset_x = colony.x - WIDTH / (2 * zoom_level)
@@ -381,12 +398,15 @@ def main():
                     offset_x = max(0, min(offset_x, WORLD_WIDTH - WIDTH / zoom_level))
                     offset_y = max(0, min(offset_y, WORLD_HEIGHT - HEIGHT / zoom_level))
 
-        for probe in probes:
-            probe.update(probes)  # Pass the list of probes to each probe's update method
-        # Replicate the probe after other probes have been updated, and replicate only once per tick
-        for probe in probes:  
-            probe.replicate()
-        # Communicate after all probes have updated and replicated
+        # Update, Replicate, Communicate:
+        for probe in probes[:]:  # Update all probes
+            probe.update()
+
+        # Probe replication is now handled by the colony
+        colony.update(probes)  # Colony updates and handles probe construction, passing the probes list
+
+        probes = [probe for probe in probes if len(probes) <= MAX_PROBES]  # Still need to enforce probe limit
+        # Communicate
         for i in range(len(probes)):
             probes[i].communicate(probes)
 
@@ -397,16 +417,13 @@ def main():
         for probe in probes:
             probe.draw(screen, offset_x, offset_y, zoom_level)
 
-            # Check if the mouse is hovering over the probe
             if probe.is_hovered(mouse_x, mouse_y, zoom_level, offset_x, offset_y):
-                # Draw the tooltip
-                tooltip_text = f"Status: {probe.state}, Cargo: {probe.cargo}"
+                tooltip_text = f"Status: {probe.state}, Cargo: {probe.cargo}, Speed: {probe.speed}"  # Added speed to tooltip
                 tooltip_surface = font.render(tooltip_text, True, (255, 255, 255))
-                screen.blit(tooltip_surface, (mouse_x + 10, mouse_y + 10))  # Offset the tooltip slightly
+                screen.blit(tooltip_surface, (mouse_x + 10, mouse_y + 10))
 
         colony.draw(screen, offset_x, offset_y, zoom_level)
 
-        # Display all three resource types
         resource_text = font.render(
             f"Colony: Min={colony.minerals}, Gas={colony.gases}, Energy={colony.energy}",
             True,
@@ -418,6 +435,14 @@ def main():
             f"Probes: {len(probes)}", True, (255, 255, 255)
         )
         screen.blit(probe_count_text, (10, 40))
+
+        # Display upgrade status
+        upgrade_text = font.render(
+            f"Probe Speed Upgrade: {'Researched' if colony.probe_speed_researched else 'Not Researched'}",
+            True,
+            (255, 255, 255),
+        )
+        screen.blit(upgrade_text, (10, 70))  # Display below probe count
 
         pygame.display.flip()
 
